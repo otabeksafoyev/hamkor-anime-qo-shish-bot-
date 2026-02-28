@@ -8,13 +8,18 @@
   },
   "dependencies": {
     "express": "^4.19.2",
+    "mongoose": "^9.2.3",
     "node-telegram-bot-api": "^0.67.0"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/otabeksafoyev/hamkor-anime-qo-shish-bot-.git"
   },
-  "keywords": ["telegram", "bot", "anime"],
+  "keywords": [
+    "telegram",
+    "bot",
+    "anime"
+  ],
   "author": "",
   "license": "ISC",
   "bugs": {
