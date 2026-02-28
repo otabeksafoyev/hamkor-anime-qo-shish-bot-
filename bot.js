@@ -1,277 +1,254 @@
-// bot.js — video alohida handler bilan tuzatilgan va multiple users + per-user channel qo'shilgan versiya (Railway webhook bilan)
+// bot.js — Telegram bot with MongoDB (Mongoose) for user states + webhook for Railway
 
 const TelegramBot = require('node-telegram-bot-api');
-const fs = require('fs');
 const express = require('express');
+const mongoose = require('mongoose');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const MONGO_URL = process.env.MONGO_URL;
 const ADMIN_ID = 8173188671;
-const DEFAULT_CHANNEL = '@Sakuramibacent';
+const DEFAULT_CHANNEL = '@Sakuramibacent'; // fallback, agar DBda bo'lmasa
 
-if (!BOT_TOKEN || !ADMIN_ID) {
-  console.error('\nBOT_TOKEN yoki ADMIN_ID to‘ldirilmagan!\n');
+if (!BOT_TOKEN || !MONGO_URL || !ADMIN_ID) {
+  console.error('BOT_TOKEN, MONGO_URL yoki ADMIN_ID to‘ldirilmagan!');
   process.exit(1);
 }
 
-// Polling o‘rniga webhook uchun bot yaratamiz
+// Mongoose ulanish
+mongoose.connect(MONGO_URL, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+})
+  .then(() => console.log('MongoDB ga ulandi'))
+  .catch(err => {
+    console.error('MongoDB ulanish xatosi:', err.message);
+    process.exit(1);
+  });
+
+// Schema'lar
+const userSchema = new mongoose.Schema({
+  _id: { type: Number, required: true }, // Telegram user ID
+  channelId: { type: String, default: null },
+  currentId: { type: String, default: '' },
+  startPart: { type: Number, default: 1 },
+  endPart: { type: Number, default: 0 },
+  currentPart: { type: Number, default: 0 },
+  mode: { type: String, default: 'idle' },
+}, { timestamps: true });
+
+const globalSchema = new mongoose.Schema({
+  _id: { type: String, default: 'global' },
+  defaultChannel: { type: String, default: DEFAULT_CHANNEL },
+});
+
+const User = mongoose.model('User', userSchema);
+const Global = mongoose.model('Global', globalSchema);
+
+// Bot yaratish
 const bot = new TelegramBot(BOT_TOKEN);
 
 let botId;
 bot.getMe().then(me => {
   botId = me.id;
-  console.log(`Bot ishga tushdi | ID: ${botId} | Admin: ${ADMIN_ID} | Default kanal: ${DEFAULT_CHANNEL}`);
+  console.log(`Bot ishga tushdi | ID: ${botId} | Admin: ${ADMIN_ID}`);
 }).catch(err => {
-  console.error('Bot ID olishda xato:', err.message);
+  console.error('Bot ID olish xatosi:', err.message);
   process.exit(1);
 });
 
-const DATA_FILE = 'data.json';
-
-let globalState = {
-  defaultChannel: DEFAULT_CHANNEL
-};
-
-let users = {}; // userId: { channelId: '@channel', currentId: '', startPart: 1, endPart: 0, currentPart: 0, mode: 'idle' }
-
-function loadState() {
-  if (fs.existsSync(DATA_FILE)) {
-    try {
-      const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
-      Object.assign(globalState, data.global || {});
-      users = data.users || {};
-      console.log('Oldingi holat yuklandi');
-    } catch (e) {
-      console.error('data.json o‘qishda xato:', e.message);
-    }
+// Global default kanalni olish (bir marta yuklaymiz)
+async function getDefaultChannel() {
+  const globalDoc = await Global.findById('global');
+  if (!globalDoc) {
+    const newGlobal = new Global({ defaultChannel: DEFAULT_CHANNEL });
+    await newGlobal.save();
+    return DEFAULT_CHANNEL;
   }
+  return globalDoc.defaultChannel;
 }
 
-function saveState() {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({
-      global: globalState,
-      users: users
-    }, null, 2));
-  } catch (e) {
-    console.error('data.json saqlashda xato:', e.message);
+// Foydalanuvchi state'ini olish / yaratish
+async function getUserState(userId) {
+  let user = await User.findById(userId);
+  if (!user) {
+    user = new User({ _id: userId });
+    await user.save();
   }
+  return user;
 }
 
-loadState();
-
-function getUserState(userId) {
-  if (!users[userId]) {
-    users[userId] = {
-      channelId: null, // null bo'lsa, default ishlatiladi
-      currentId: '',
-      startPart: 1,
-      endPart: 0,
-      currentPart: 0,
-      mode: 'idle'
-    };
-    saveState();
-  }
-  return users[userId];
-}
-
-function parseChannelInput(input) {
-  input = input.trim();
-  if (input.startsWith('https://t.me/')) {
-    return '@' + input.split('/').pop();
-  } else if (input.startsWith('@')) {
-    return input;
-  } else if (/^-?\d+$/.test(input)) {
-    return input; // Channel ID bo'lsa
-  } else {
-    return '@' + input; // Oddiy nom bo'lsa, @ qo'shamiz
-  }
-}
-
-// ─── Kanal o'zgartirish (/setchannel) ───
-bot.onText(/\/setchannel\s+(.+)/, (msg, match) => {
+// ─── /setchannel ───
+bot.onText(/\/setchannel\s+(.+)/, async (msg, match) => {
   const userId = msg.from.id;
   const cid = msg.chat.id;
   const rawInput = match[1].trim();
-  const newChannel = parseChannelInput(rawInput);
+  let newChannel = rawInput;
 
-  bot.getChatMember(newChannel, botId)
-    .then(member => {
-      if (['administrator', 'creator'].includes(member.status)) {
-        if (userId === ADMIN_ID) {
-          // Admin global default ni o'zgartiradi
-          globalState.defaultChannel = newChannel;
-          bot.sendMessage(cid, `✅ Global default kanal o'zgartirildi: ${newChannel}. Bu kanal qo'shmagan foydalanuvchilarga ta'sir qiladi.`);
-        } else {
-          // Oddiy user o'z shaxsiy kanalini o'zgartiradi
-          const userState = getUserState(userId);
-          userState.channelId = newChannel;
-          bot.sendMessage(cid, `✅ Sizning kanalingiz o'zgartirildi: ${newChannel}. Endi seriyalaringiz shu kanalga yuklanadi.`);
-        }
-        saveState();
-      } else {
-        bot.sendMessage(cid, `❌ Bot "${newChannel}" kanalida admin emas! Iltimos, botni shu kanalga admin qiling va qayta urinib ko'ring.`);
-      }
-    })
-    .catch(err => {
-      bot.sendMessage(cid, `Xato: Kanal topilmadi yoki boshqa xato - ${err.message}. Kanal nomi, ID yoki URL (masalan: https://t.me/ongoing_ozbek) kiriting.`);
-    });
+  // Kanal nomini to'g'rilash
+  if (rawInput.startsWith('https://t.me/')) {
+    newChannel = '@' + rawInput.split('/').pop();
+  } else if (!rawInput.startsWith('@') && !/^-?\d+$/.test(rawInput)) {
+    newChannel = '@' + rawInput;
+  }
+
+  try {
+    const member = await bot.getChatMember(newChannel, botId);
+    if (!['administrator', 'creator'].includes(member.status)) {
+      return bot.sendMessage(cid, `❌ Bot "${newChannel}" kanalida admin emas!`);
+    }
+
+    if (userId === ADMIN_ID) {
+      // Admin globalni o'zgartiradi
+      await Global.findOneAndUpdate(
+        { _id: 'global' },
+        { defaultChannel: newChannel },
+        { upsert: true, new: true }
+      );
+      bot.sendMessage(cid, `✅ Global kanal o'zgartirildi: ${newChannel}`);
+    } else {
+      // Oddiy user o'z kanalini saqlaydi
+      const user = await getUserState(userId);
+      user.channelId = newChannel;
+      await user.save();
+      bot.sendMessage(cid, `✅ Sizning kanalingiz saqlandi: ${newChannel}`);
+    }
+  } catch (err) {
+    bot.sendMessage(cid, `Xato: ${err.message || 'Kanal topilmadi yoki noto‘g‘ri'}`);
+  }
 });
 
-// ─── /addid boshlash ───
-bot.onText(/\/addid/i, (msg) => {
+// ─── /addid ───
+bot.onText(/\/addid/i, async (msg) => {
   const userId = msg.from.id;
   const cid = msg.chat.id;
-  const userState = getUserState(userId);
+  const user = await getUserState(userId);
 
   bot.sendMessage(cid, `Seriya ID sini yuboring (masalan: OnePiece, Naruto)`);
-  userState.mode = 'waiting_id';
-  userState.currentId = '';
-  userState.startPart = 1;
-  userState.endPart = 0;
-  userState.currentPart = 0;
-  saveState();
+  user.mode = 'waiting_id';
+  user.currentId = '';
+  user.startPart = 1;
+  user.endPart = 0;
+  user.currentPart = 0;
+  await user.save();
 });
 
-// ─── Matnli xabarlar (ID, start, end) ───
-bot.on('text', (msg) => {
+// ─── Text handler ───
+bot.on('text', async (msg) => {
   if (msg.from.is_bot) return;
   const userId = msg.from.id;
   const cid = msg.chat.id;
   const text = msg.text.trim();
-  const userState = getUserState(userId);
+  const user = await getUserState(userId);
 
-  if (userState.mode === 'waiting_id' && text && !text.startsWith('/')) {
-    userState.currentId = text;
-    userState.mode = 'waiting_start';
-    bot.sendMessage(cid, 'Qaysi qismdan boshlaymiz? (masalan: 1)');
-    saveState();
-    return;
+  if (user.mode === 'waiting_id' && text && !text.startsWith('/')) {
+    user.currentId = text;
+    user.mode = 'waiting_start';
+    await user.save();
+    return bot.sendMessage(cid, 'Qaysi qismdan boshlaymiz? (masalan: 1)');
   }
 
-  if (userState.mode === 'waiting_start' && text && !text.startsWith('/')) {
+  if (user.mode === 'waiting_start' && text && !text.startsWith('/')) {
     const start = parseInt(text);
     if (isNaN(start) || start < 1) {
       return bot.sendMessage(cid, '1 yoki undan katta butun son kiriting.');
     }
-    userState.startPart = start;
-    userState.currentPart = start;
-    userState.mode = 'waiting_end';
-    bot.sendMessage(cid, 'Qaysi qism bilan tugatamiz? (masalan: 12)');
-    saveState();
-    return;
+    user.startPart = start;
+    user.currentPart = start;
+    user.mode = 'waiting_end';
+    await user.save();
+    return bot.sendMessage(cid, 'Qaysi qism bilan tugatamiz? (masalan: 12)');
   }
 
-  if (userState.mode === 'waiting_end' && text && !text.startsWith('/')) {
+  if (user.mode === 'waiting_end' && text && !text.startsWith('/')) {
     const end = parseInt(text);
-    if (isNaN(end) || end < userState.startPart) {
-      return bot.sendMessage(cid, `Oxirgi qism ${userState.startPart} dan katta bo'lishi kerak.`);
+    if (isNaN(end) || end < user.startPart) {
+      return bot.sendMessage(cid, `Oxirgi qism ${user.startPart} dan katta bo'lishi kerak.`);
     }
-    userState.endPart = end;
-    userState.mode = 'waiting_videos';
+    user.endPart = end;
+    user.mode = 'waiting_videos';
 
-    const total = end - userState.startPart + 1;
-    const targetChannel = userState.channelId || globalState.defaultChannel;
+    const total = end - user.startPart + 1;
+    const targetChannel = user.channelId || (await getDefaultChannel());
+
     bot.sendMessage(cid,
-      `✅ Boshladik!\n` +
-      `ID: ${userState.currentId}\n` +
-      `Qismlar: ${userState.startPart} – ${end} (${total} ta)\n` +
-      `Kanal: ${targetChannel}\n\n` +
-      `Videolarni ketma-ket yuboring...`
+      `✅ Boshladik!\nID: ${user.currentId}\nQismlar: ${user.startPart} – ${end} (${total} ta)\nKanal: ${targetChannel}\n\nVideolarni yuboring...`
     );
-    bot.sendMessage(cid, `Hozir ${userState.currentPart}-qism kutilyapti`);
-    saveState();
+    bot.sendMessage(cid, `Hozir ${user.currentPart}-qism kutilyapti`);
+    await user.save();
     return;
   }
 
-  // Agar rejim faol bo'lsa va boshqa matn kelsa (buyruqlar bundan mustasno)
-  if (userState.mode !== 'idle' && !text.startsWith('/')) {
-    bot.sendMessage(cid, 'Iltimos, kerakli raqam yoki video yuboring.\nJarayonni qaytadan boshlash uchun /addid');
+  if (user.mode !== 'idle' && !text.startsWith('/')) {
+    bot.sendMessage(cid, 'Iltimos, raqam yoki video yuboring.\nQayta boshlash: /addid');
   }
 });
 
-// ─── VIDEO QABUL QILISH — ALOHIDA HANDLER ───
-bot.on('video', (msg) => {
+// ─── Video handler ───
+bot.on('video', async (msg) => {
   const userId = msg.from.id;
-  const userState = getUserState(userId);
-  if (userState.mode !== 'waiting_videos' || userState.currentPart > userState.endPart) {
-    // Agar jarayon faol bo'lmasa, video qabul qilinmaydi
-    return;
-  }
+  const user = await getUserState(userId);
+  if (user.mode !== 'waiting_videos' || user.currentPart > user.endPart) return;
 
   const cid = msg.chat.id;
-  const targetChannel = userState.channelId || globalState.defaultChannel;
-  const caption = `ID: ${userState.currentId}\nQism: ${userState.currentPart}`;
+  const targetChannel = user.channelId || (await getDefaultChannel());
+  const caption = `ID: ${user.currentId}\nQism: ${user.currentPart}`;
 
-  // Yuklashdan oldin bot adminligini qayta tekshirish (xavfsizlik uchun)
-  bot.getChatMember(targetChannel, botId)
-    .then(member => {
-      if (!['administrator', 'creator'].includes(member.status)) {
-        return bot.sendMessage(cid, `❌ Bot "${targetChannel}" kanalida admin emas! Iltimos, botni admin qiling yoki /setchannel orqali yangilang.`);
-      }
+  try {
+    const member = await bot.getChatMember(targetChannel, botId);
+    if (!['administrator', 'creator'].includes(member.status)) {
+      return bot.sendMessage(cid, `❌ Bot "${targetChannel}" da admin emas!`);
+    }
 
-      bot.sendVideo(targetChannel, msg.video.file_id, { caption })
-        .then(() => {
-          bot.sendMessage(cid, `✔ ${userState.currentPart}-qism kanalga yuklandi`);
-          userState.currentPart++;
-          saveState();
+    await bot.sendVideo(targetChannel, msg.video.file_id, { caption });
+    bot.sendMessage(cid, `✔ ${user.currentPart}-qism yuklandi`);
 
-          if (userState.currentPart > userState.endPart) {
-            bot.sendMessage(cid, '✅ Hammasi yuklandi!\nYana seriya qo‘shish uchun /addid');
-            userState.mode = 'idle';
-            saveState();
-          } else {
-            bot.sendMessage(cid, `Keyingi: ${userState.currentPart}-qism kutilyapti`);
-          }
-        })
-        .catch(err => {
-          console.error('Video jo‘natish xatosi:', err.message);
-          bot.sendMessage(cid, 'Videoni kanalga jo‘natib bo‘lmadi. Bot adminligini tekshiring.');
-        });
-    })
-    .catch(err => {
-      bot.sendMessage(cid, `Xato: Kanal holatini tekshirishda xato - ${err.message}.`);
-    });
+    user.currentPart++;
+    if (user.currentPart > user.endPart) {
+      bot.sendMessage(cid, '✅ Hammasi yuklandi! /addid bilan davom ettiring');
+      user.mode = 'idle';
+    } else {
+      bot.sendMessage(cid, `Keyingi: ${user.currentPart}-qism kutilyapti`);
+    }
+    await user.save();
+  } catch (err) {
+    console.error('Video jo‘natish xatosi:', err.message);
+    bot.sendMessage(cid, 'Video yuklanmadi. Bot adminligini tekshiring.');
+  }
 });
 
-// /start yo'riqnomasi
+// ─── /start ───
 bot.onText(/\/start/i, (msg) => {
   bot.sendMessage(msg.chat.id,
-    'Seriya yuklash bot:\n\n' +
-    '1. O\'z kanalingizni qo‘shing (majburiy emas): /setchannel @kanal_nomi (yoki ID, yoki https://t.me/kanal_url)\n' +
-    '   - Agar qo‘shmasangiz, seriyalar admin o‘rnatgan default kanalga yuklanadi.\n' +
+    'Anime seriya yuklash bot:\n\n' +
+    '1. /setchannel @kanal_nomi yoki https://t.me/kanal (majburiy emas)\n' +
     '2. /addid\n' +
-    '3. Seriya nomini yoz\n' +
-    '4. Boshlanish qismini kiriting\n' +
-    '5. Tugash qismini kiriting\n' +
+    '3. Seriya ID\n' +
+    '4. Boshlanish qismi\n' +
+    '5. Tugash qismi\n' +
     '6. Videolarni birma-bir yuboring\n\n' +
-    'Admin uchun: /setchannel @kanal global default ni o‘zgartiradi.'
+    'Admin: /setchannel bilan global kanalni o‘zgartiradi.'
   );
 });
 
-// ─── Express server va webhook ───
+// ─── Express + Webhook ───
 const app = express();
 const PORT = process.env.PORT || 8080;
 const WEBHOOK_PATH = '/webhook';
 
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
 app.post(WEBHOOK_PATH, (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-app.get('/', (req, res) => {
-  res.send('Bot ishlamoqda!');
-});
+app.get('/', (req, res) => res.send('Bot ishlamoqda'));
 
 app.listen(PORT, async () => {
-  console.log(`Server ishlamoqda: port ${PORT}`);
+  console.log(`Server port ${PORT} da ishlamoqda`);
 
   const hostname = process.env.RAILWAY_PUBLIC_DOMAIN;
-
   if (!hostname) {
-    console.error('XATO: RAILWAY_PUBLIC_DOMAIN topilmadi! Railway environment variables ni tekshiring.');
+    console.error('RAILWAY_PUBLIC_DOMAIN topilmadi!');
     return;
   }
 
@@ -279,13 +256,11 @@ app.listen(PORT, async () => {
 
   try {
     await bot.deleteWebHook();
-    console.log('Eski webhook o‘chirildi');
-
     await bot.setWebHook(webhookUrl);
     console.log(`Webhook o‘rnatildi: ${webhookUrl}`);
   } catch (err) {
-    console.error('Webhook o‘rnatishda xato:', err.message);
+    console.error('Webhook xatosi:', err.message);
   }
 });
 
-console.log('Bot ishlamoqda...');
+console.log('Bot ishga tushdi...');
